@@ -25,7 +25,7 @@ description: 在 MarsWallex 测试环境模拟卡交易（授权、授权失败�
 
 ## 准备
 
-1. Python 3.8 及以上，安装依赖：`pip install cryptography`。
+1. Python 3.8 及以上和 `openssl` 命令，不需要安装第三方包。macOS、Linux 一般自带 openssl；Windows 请在 Git Bash 中运行，或安装 OpenSSL 并加入 PATH。
 2. 复制 `config/config.env.example` 为 `config/config.env`，填写 `DEVELOPER_ID`、`API_TOKEN` 和私钥。配置项未填写时脚本退出码为 2，提示缺哪一项；此时请用户填写，不要编造。
 3. 本机出口 IP 需要在开放平台的 IP 白名单中，否则返回 401 `The ip is not authorized`。
 4. 准备一张测试环境的卡，记下卡 ID（`card_id`）和卡币种。

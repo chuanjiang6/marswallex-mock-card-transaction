@@ -12,13 +12,15 @@ MarsWallex 测试环境模拟卡交易工具。
     签名原文:       METHOD&URI&EPOCH&BODY[&URL编码后的QUERY]
     URI 含 context-path，例如 /portal/api/v1/card/mock-transactions
 
-依赖：Python 3.8+，pip install cryptography
+依赖：Python 3.8+ 与本机 openssl 命令，无需安装第三方包
 """
 import argparse
 import base64
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -68,35 +70,48 @@ def load_config(path):
     return conf
 
 
-def load_private_key(conf):
-    """支持 PEM 文件（PKCS#8 / PKCS#1），或不带头尾的 base64 私钥。"""
+def pem_from_base64(b64):
+    """把不带头尾的 base64 私钥包装成 PEM，按 DER 结构区分 PKCS#8 与 PKCS#1。"""
+    b64 = "".join(b64.split())
     try:
-        from cryptography.hazmat.primitives import serialization
-    except ImportError:
-        raise ConfigError("缺少依赖 cryptography，请先执行：pip install cryptography")
+        der = base64.b64decode(b64)
+        # DER: 30 <长度> 02 01 00 <下一个标签>；下一个标签是 SEQUENCE(0x30) 为 PKCS#8，INTEGER(0x02) 为 PKCS#1
+        offset = 2 + (der[1] & 0x7F if der[1] & 0x80 else 0) + 3
+        kind = "RSA PRIVATE KEY" if der[offset] == 0x02 else "PRIVATE KEY"
+    except (ValueError, IndexError):
+        raise ConfigError("PRIVATE_KEY 不是有效的 base64 私钥")
+    lines = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (kind, lines, kind)
+
+
+def rsa_sign(conf, text):
+    """调用本机 openssl 做 SHA256withRSA 签名，返回 base64。"""
+    tmp_path = None
     if conf.get("PRIVATE_KEY_FILE"):
-        path = os.path.expanduser(conf["PRIVATE_KEY_FILE"])
-        if not os.path.isabs(path):
-            path = os.path.join(conf["_CONFIG_DIR"], path)
-        if not os.path.exists(path):
-            raise ConfigError("私钥文件不存在：%s" % path)
-        with open(path, "rb") as f:
-            data = f.read()
+        key_path = os.path.expanduser(conf["PRIVATE_KEY_FILE"])
+        if not os.path.isabs(key_path):
+            key_path = os.path.join(conf["_CONFIG_DIR"], key_path)
+        if not os.path.exists(key_path):
+            raise ConfigError("私钥文件不存在：%s" % key_path)
     else:
-        data = conf["PRIVATE_KEY"].encode("utf-8")
+        pem = pem_from_base64(conf["PRIVATE_KEY"])
+        fd, tmp_path = tempfile.mkstemp(prefix="mw_key_", suffix=".pem")
+        with os.fdopen(fd, "w") as f:
+            f.write(pem)
+        key_path = tmp_path
     try:
-        if b"-----BEGIN" in data:
-            return serialization.load_pem_private_key(data, password=None)
-        return serialization.load_der_private_key(base64.b64decode(b"".join(data.split())), password=None)
-    except Exception as e:
-        raise ConfigError("私钥解析失败（需为未加密的 RSA 私钥）：%s" % type(e).__name__)
-
-
-def rsa_sign(private_key, text):
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-    signature = private_key.sign(text.encode("utf-8"), padding.PKCS1v15(), hashes.SHA256())
-    return base64.b64encode(signature).decode("ascii")
+        # -passin pass: 让加密私钥直接报错，避免 openssl 停下来等待输入口令
+        proc = subprocess.run(["openssl", "dgst", "-sha256", "-sign", key_path, "-passin", "pass:"],
+                              input=text.encode("utf-8"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        raise ConfigError("找不到 openssl 命令。macOS / Linux 一般自带；Windows 请在 Git Bash 中运行，或安装 OpenSSL 并加入 PATH")
+    finally:
+        if tmp_path:
+            os.remove(tmp_path)
+    if proc.returncode != 0:
+        raise ConfigError("openssl 签名失败（需为未加密的 RSA 私钥）：%s"
+                          % proc.stderr.decode("utf-8", errors="replace").strip())
+    return base64.b64encode(proc.stdout).decode("ascii")
 
 
 def java_url_encode(value):
@@ -129,7 +144,7 @@ def call(conf, method, path, body=None, query=None, dry_run=False):
     sign_text = build_sign_text(method, sign_uri, epoch, body_text, query_string)
 
     auth = base64.b64encode(("%s:%s" % (conf["DEVELOPER_ID"], conf["API_TOKEN"])).encode("utf-8")).decode("ascii")
-    signature = rsa_sign(load_private_key(conf), sign_text)
+    signature = rsa_sign(conf, sign_text)
     headers = {
         "Content-Type": "application/json;charset=UTF-8",
         "Accept": "application/json",
